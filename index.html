@@ -11,10 +11,10 @@
 <meta name="twitter:card" content="summary_large_image">
 <meta property="og:url" content="https://brucesweater.github.io/">
 <link rel="canonical" href="https://brucesweater.github.io/">
-<meta property="og:image" content="https://brucesweater.github.io/og.jpg">
+<meta property="og:image" content="https://brucesweater.github.io/og.jpg?v=hole">
 <meta property="og:image:width" content="1600">
 <meta property="og:image:height" content="840">
-<meta property="og:image:alt" content="Bruce Gao's card, gold foil on navy">
+<meta property="og:image:alt" content="A gold black hole bending its own light, above the name Bruce Gao">
 <link rel="icon" type="image/png" href="favicon.png">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <style>:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}img{max-width:100%}[hidden]{display:none!important}</style>
@@ -3359,7 +3359,7 @@ void main() {
     let canvas = null, gl = null, prog = null, loop = null, ac = null, ro = null, gov = null;
     let W = 1, H = 1, scale = 1, k = 1, cx = 0, cy = 0;
     const cam = { az: 0.95, incl: 0.1, roll: -0.11, vaz: 0, vincl: 0 };
-    let t = 0, spin = 0, intro = 0, drag = null, mx = 0, my = 0, tmx = 0, tmy = 0, hud = 1, dirty = true;
+    let t = 0, spin = 0, intro = 0, drag = null, mx = 0, my = 0, tmx = 0, tmy = 0, hud = 1, dirty = true, framing = null;
 
     function resize() {
       scale = gov.scale;
@@ -3379,6 +3379,7 @@ void main() {
       cy = vh * (portrait ? 0.36 : 0.36);
       // fit the disk to the width, the shadow to a share of the height, whichever is smaller
       k = Math.min((W * 0.5) / (DISK / D0), (vh * (portrait ? 0.15 : 0.145)) / (2.6 / D0));
+      if (framing) { cy = vh * framing.cy; k = framing.shadow / (2.6 / D0); }
       resize();
     }
 
@@ -3520,7 +3521,9 @@ void main() {
 
     // testing: pin the render scale (1 = one pixel per CSS pixel) with the governor off
     function quality(q) { if (!gl) return; gov = { scale: q, draw: (g2, d) => { d(); return false; } }; resize(); }
-    return { mount, unmount, step, shot, quality };
+    // the share image: hole centre at `cyShare` of the height, shadow `shadowPx` CSS px across its radius
+    function frame(cyShare, shadowPx) { framing = { cy: cyShare, shadow: shadowPx }; layout(); dirty = true; }
+    return { mount, unmount, step, shot, quality, frame };
   })();
   /* ---------- Liquid Metal: the name pushed up out of a pool of chrome. Touch makes ripples;
      the chrome reflects a studio lit by soft boxes that slide as you move. ---------- */
