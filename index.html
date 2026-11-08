@@ -2415,31 +2415,40 @@ void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
     };
   }
 
-  // Render-scale governor. Every 90 frames it times one draw on the GPU itself (a one-pixel
+  // Render-scale governor. Every 30 frames at first, then every 120, it times one draw on the GPU itself (a one-pixel
   // readPixels waits for the draw to finish), so a 30 fps cap from Low Power Mode or a throttled
   // background tab is not mistaken for a slow GPU. Cost grows with scale², hence the square root.
   function governor(min, max, start) {
-    let scale = start, frames = 0;
+    let scale = start, frames = 0, slow = 0;
     const px = new Uint8Array(4);
     return {
       get scale() { return scale; },
       draw(gl, draw) {
         frames++;
-        if (frames % 90 !== 4) { draw(); return false; }
+        const probe = frames === 4 || (frames < 300 ? frames % 30 === 4 : frames % 120 === 4);
+        if (!probe) { draw(); return false; }
         gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
         const t0 = performance.now();
         draw();
         gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
         const ms = performance.now() - t0;
-        if (ms > 13 && scale > min) { scale = Math.max(min, scale * Math.sqrt(9 / ms)); return true; }
-        if (ms < 4.5 && scale < max) { scale = Math.min(max, scale * 1.15); return true; }
+        // one slow reading can be the compositor or another tab; step down only on two in a row
+        if (ms > 14) {
+          if (++slow < 2 || scale <= min) return false;
+          slow = 0;
+          scale = Math.max(min, scale * Math.sqrt(10 / ms));
+          return true;
+        }
+        slow = 0;
+        if (ms < 5 && scale < max) { scale = Math.min(max, scale * 1.15); return true; }
         return false;
       }
     };
   }
   /* ---------- sound: every effect is synthesized live with Web Audio, no audio files.
      Browsers allow sound only after a tap or key press, so nothing plays before that.
-     Phone speakers drop everything under ~200 Hz, so low sounds carry audible overtones. ---------- */
+     Phone speakers drop everything under ~200 Hz, so low sounds carry audible overtones.
+     One shared hall reverb (a generated impulse response) gives the sounds their space. ---------- */
   const SFX = (() => {
     const AC = window.AudioContext || window.webkitAudioContext;
     let ctx = null, bus = null, live = false, amb = null, ambId = null, want = null, on = true, queue = [];
@@ -2449,6 +2458,20 @@ void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
     const SCALE = [130.81, 146.83, 164.81, 196.0, 220.0, 261.63, 293.66, 329.63, 392.0, 440.0, 523.25, 587.33, 659.25, 783.99];
     const MARIMBA = [523.25, 587.33, 659.25, 783.99, 880.0, 1046.5, 1174.66, 1318.51];
 
+    // a hall: stereo noise that darkens as it decays, after a short gap so hits stay clear
+    function hall(c, secs, curve) {
+      const sr = c.sampleRate, n = Math.floor(sr * secs), gap = Math.floor(sr * 0.018), ir = c.createBuffer(2, n, sr);
+      for (let ch = 0; ch < 2; ch++) {
+        const d = ir.getChannelData(ch);
+        let lp = 0;
+        for (let i = gap; i < n; i++) {
+          const t = (i - gap) / (n - gap);
+          lp += (Math.random() * 2 - 1 - lp) * (0.6 - 0.48 * t);
+          d[i] = lp * Math.pow(1 - t, curve);
+        }
+      }
+      return ir;
+    }
     function master(c) {
       const comp = c.createDynamicsCompressor();
       comp.threshold.value = -18;
@@ -2460,6 +2483,19 @@ void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
       g.gain.value = on ? 0.9 : 0.0001;
       g.connect(comp);
       comp.connect(c.destination);
+      const verb = c.createConvolver(), wet = c.createGain();
+      verb.buffer = hall(c, 3.4, 2.6);
+      wet.gain.value = 0.85;
+      verb.connect(wet);
+      wet.connect(g);
+      g.verb = verb;
+      return g;
+    }
+    // a send into the hall, `amt` loud
+    function send(c, d, amt) {
+      const g = c.createGain();
+      g.gain.value = amt;
+      g.connect(d.verb || d);
       return g;
     }
     function noise(c) {
@@ -2556,68 +2592,75 @@ void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
       },
       open(c, d, t) { swoosh(c, d, t, 260, 2400, 0.32, 0.12); },
       close(c, d, t) { swoosh(c, d, t, 2200, 300, 0.26, 0.09); },
-      boom(c, d, t) {
-        const sub = osc(c, "sine", 95, t, t + 2.1);
+      // touching the black hole: a deep soft impact, then a chord that blooms out of the hall,
+      // with the rising chirp of a merger (f ∝ τ^-3/8) sitting quietly underneath
+      hit(c, d, t) {
+        const sub = osc(c, "sine", 62, t, t + 2.4);
         sub.frequency.exponentialRampToValueAtTime(31, t + 1.6);
-        sub.connect(env(c, d, t, 0.01, 0.7, 1.9));
-        const mid = osc(c, "triangle", 170, t, t + 0.9);
-        mid.frequency.exponentialRampToValueAtTime(70, t + 0.5);
-        mid.connect(env(c, d, t, 0.005, 0.32, 0.6));
-        const n = hiss(c, t, t + 1.4), lp = filter(c, "lowpass", 600, 0.7);
-        lp.frequency.exponentialRampToValueAtTime(80, t + 1.2);
+        sub.connect(env(c, d, t, 0.018, 0.62, 2.0));
+        const body = osc(c, "triangle", 124, t, t + 1.2);
+        body.frequency.exponentialRampToValueAtTime(62, t + 0.7);
+        body.connect(env(c, d, t, 0.012, 0.22, 0.85));
+        body.connect(env(c, send(c, d, 0.5), t, 0.012, 0.22, 0.85));
+        const n = hiss(c, t, t + 0.5), lp = filter(c, "lowpass", 420, 0.6);
+        lp.frequency.exponentialRampToValueAtTime(90, t + 0.35);
         n.connect(lp);
-        lp.connect(env(c, d, t, 0.004, 0.4, 1.0));
+        lp.connect(env(c, d, t, 0.006, 0.12, 0.3));
+        // the bloom: A minor 9, slow attack, long tail mostly in the hall
+        const wet = send(c, d, 1.0);
+        [[220, 0.05], [329.63, 0.045], [440, 0.04], [523.25, 0.03], [659.25, 0.026], [987.77, 0.014]].forEach(([f, a], i) => {
+          const s = osc(c, "sine", f, t + 0.06, t + 4.2);
+          s.detune.setValueAtTime(i % 2 ? 4 : -4, t);
+          s.connect(env(c, d, t + 0.06, 0.55 + i * 0.05, a, 3.0));
+          s.connect(env(c, wet, t + 0.06, 0.55 + i * 0.05, a * 1.6, 3.2));
+        });
+        const T = 1.1, steps = 96, fr = new Float32Array(steps);
+        for (let i = 0; i < steps; i++) fr[i] = Math.min(900, 90 * Math.pow(1 - (i / (steps - 1)) * 0.985, -0.375));
+        const ch = c.createOscillator();
+        ch.type = "sine";
+        ch.frequency.setValueCurveAtTime(fr, t + 0.05, T);
+        const cl = filter(c, "lowpass", 1400, 0.5), cg = c.createGain();
+        cg.gain.setValueAtTime(0.0001, t);
+        cg.gain.exponentialRampToValueAtTime(0.05, t + 0.9);
+        cg.gain.exponentialRampToValueAtTime(0.0001, t + T + 0.2);
+        ch.connect(cl);
+        cl.connect(cg);
+        cg.connect(d);
+        cg.connect(send(c, d, 0.9));
+        ch.start(t + 0.05);
+        ch.stop(t + T + 0.3);
       },
-      // two black holes spiralling together: the pitch and loudness climb ever faster (f ∝ τ^-3/8,
-      // the shape of the gravitational-wave chirp), then a short ringdown
-      chirp(c, d, t) {
-        const T = 0.95, steps = 96, fr = new Float32Array(steps), gr = new Float32Array(steps);
-        for (let i = 0; i < steps; i++) {
-          const tau = 1 - (i / (steps - 1)) * 0.985;
-          const f = Math.min(1100, 110 * Math.pow(tau, -0.375));
-          fr[i] = f;
-          gr[i] = 0.04 + 0.32 * Math.pow(f / 1100, 0.7);
-        }
-        const o = c.createOscillator();
-        o.type = "sine";
-        o.frequency.setValueCurveAtTime(fr, t, T);
-        const g = c.createGain();
-        g.gain.setValueCurveAtTime(gr, t, T);
-        g.gain.setTargetAtTime(0.0001, t + T + 0.001, 0.05);
-        o.connect(g);
-        g.connect(d);
-        o.start(t);
-        o.stop(t + T + 0.4);
-        const rd = osc(c, "sine", 760, t + T, t + T + 0.5);
-        rd.frequency.exponentialRampToValueAtTime(560, t + T + 0.4);
-        rd.connect(env(c, d, t + T, 0.004, 0.2, 0.35));
-      },
-      // a drop of mercury: a quick falling plop and a thin metallic ring (two-operator FM)
+      // a bead of mercury: a warm falling bloop and a clear glassy ring (harmonic, so it never clangs)
       drop(c, d, t, o) {
         const p = o.pitch || 1, v = o.gain == null ? 1 : o.gain;
-        const s = osc(c, "sine", 1150 * p, t, t + 0.25);
-        s.frequency.exponentialRampToValueAtTime(260 * p, t + 0.085);
-        s.connect(env(c, d, t, 0.002, 0.34 * v, 0.16));
-        const car = osc(c, "sine", 1320 * p, t, t + 0.9), mod = osc(c, "sine", 1320 * p * 1.41, t, t + 0.9);
-        const mg = c.createGain();
-        mg.gain.setValueAtTime(700 * p, t);
-        mg.gain.exponentialRampToValueAtTime(1, t + 0.6);
-        mod.connect(mg);
-        mg.connect(car.frequency);
-        car.connect(env(c, d, t + 0.01, 0.004, 0.07 * v, 0.7));
+        const s = osc(c, "sine", 560 * p, t, t + 0.35);
+        s.frequency.exponentialRampToValueAtTime(190 * p, t + 0.11);
+        s.connect(env(c, d, t, 0.004, 0.42 * v, 0.22));
+        const wet = send(c, d, 0.55);
+        [[1046.5, 0.065], [2093, 0.028], [3139.5, 0.01]].forEach(([f, a]) => {
+          const r = osc(c, "sine", f * p, t + 0.02, t + 1.2);
+          r.connect(env(c, d, t + 0.02, 0.003, a * v, 0.9));
+          r.connect(env(c, wet, t + 0.02, 0.003, a * v, 0.9));
+        });
       },
       swell(c, d, t) {
+        const wet = send(c, d, 0.7);
         const n = hiss(c, t, t + 1.8), bp = filter(c, "bandpass", 300, 3);
         bp.frequency.exponentialRampToValueAtTime(2200, t + 1.1);
         n.connect(bp);
-        bp.connect(env(c, d, t, 0.5, 0.16, 1.1));
+        bp.connect(env(c, d, t, 0.5, 0.08, 1.1));
+        bp.connect(env(c, wet, t, 0.5, 0.08, 1.1));
         const s = osc(c, "sine", 140, t, t + 1.8);
         s.frequency.exponentialRampToValueAtTime(420, t + 0.9);
-        s.connect(env(c, d, t, 0.3, 0.12, 1.2));
+        s.connect(env(c, d, t, 0.3, 0.1, 1.2));
+        s.connect(env(c, wet, t, 0.3, 0.1, 1.2));
       },
       marimba(c, d, t, o) {
         const f = o.f || MARIMBA[(o.i || 0) % MARIMBA.length];
-        osc(c, "sine", f, t, t + 0.7).connect(env(c, d, t, 0.002, 0.28, 0.55));
+        const wet = send(c, d, 0.18);
+        const a = osc(c, "sine", f, t, t + 0.7);
+        a.connect(env(c, d, t, 0.002, 0.28, 0.55));
+        a.connect(env(c, wet, t, 0.002, 0.28, 0.55));
         osc(c, "sine", f * 3.93, t, t + 0.2).connect(env(c, d, t, 0.001, 0.09, 0.07));
         osc(c, "triangle", f * 9.4, t, t + 0.05).connect(env(c, d, t, 0.0005, 0.03, 0.02));
       },
@@ -2630,7 +2673,7 @@ void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
         n.connect(lp);
         lp.connect(env(c, d, t, 0.001, 0.3 * v, 0.05));
       },
-      // a string plucked like a guqin: a little slide up into the note, a woody body
+      // a string plucked like a guqin: a little slide up into the note, a woody body, a hall around it
       pluck(c, d, t, o) {
         const v = o.gain == null ? 1 : o.gain;
         const src = c.createBufferSource();
@@ -2645,6 +2688,7 @@ void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
         lp.connect(body);
         body.connect(g);
         g.connect(pan(c, d, o.pan || 0));
+        g.connect(send(c, d, 0.35));
         src.start(t);
         src.stop(t + 2.7);
       },
@@ -2654,9 +2698,11 @@ void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
         s.connect(env(c, d, t, 0.002, 0.26, 0.12));
       },
       bell(c, d, t, o) {
-        const f = o.f || 1046.5;
+        const f = o.f || 1046.5, wet = send(c, d, 0.4);
         [[1, 0.2, 2.4], [2.76, 0.06, 1.2], [5.4, 0.03, 0.6]].forEach(([r, a, dur]) => {
-          osc(c, "sine", f * r, t, t + dur + 0.1).connect(env(c, d, t, 0.002, a, dur));
+          const s = osc(c, "sine", f * r, t, t + dur + 0.1);
+          s.connect(env(c, d, t, 0.002, a, dur));
+          s.connect(env(c, wet, t, 0.002, a, dur));
         });
       },
       shutter(c, d, t) {
@@ -2682,7 +2728,7 @@ void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
         }
       },
       // what each look sounds like as it opens
-      "to-horizon"(c, d, t) { FX.boom(c, d, t); FX.chirp(c, d, t + 0.25); },
+      "to-horizon"(c, d, t) { FX.hit(c, d, t); },
       "to-mercury"(c, d, t) { FX.drop(c, d, t, { pitch: 0.8, gain: 1.2 }); FX.swell(c, d, t + 0.15); },
       "to-poster"(c, d, t) { FX.stamp(c, d, t, {}); MARIMBA.slice(0, 5).forEach((f, i) => FX.marimba(c, d, t + 0.12 + i * 0.075, { f })); },
       "to-ink"(c, d, t) { SCALE.slice(5, 11).forEach((f, i) => FX.pluck(c, d, t + i * 0.085, { f, gain: 0.7, pan: -0.4 + i * 0.16 })); },
@@ -2702,62 +2748,111 @@ void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
       const api = Object.assign({}, extra);
       api.stop = (f) => {
         const now = c.currentTime;
-        if (out.gain.cancelAndHoldAtTime) out.gain.cancelAndHoldAtTime(now); else out.gain.cancelScheduledValues(now);
-        out.gain.setTargetAtTime(0.0001, now, f / 4);
+        [out, api.wet].forEach((g) => {
+          if (!g) return;
+          if (g.gain.cancelAndHoldAtTime) g.gain.cancelAndHoldAtTime(now); else g.gain.cancelScheduledValues(now);
+          g.gain.setTargetAtTime(0.0001, now, f / 4);
+        });
         srcs.forEach((s) => { try { s.stop(now + f + 0.1); } catch (e) {} });
         if (extra && extra.end) extra.end();
-        setTimeout(() => out.disconnect(), (f + 0.3) * 1000);
+        setTimeout(() => { out.disconnect(); if (api.wet) api.wet.disconnect(); }, (f + 0.3) * 1000);
       };
       return api;
     }
+    // a voice that drifts: a sine whose loudness wanders slowly on its own clock
+    function drift(c, f, level, rate, dest, srcs) {
+      const o = c.createOscillator(), g = c.createGain(), l = c.createOscillator(), lg = c.createGain();
+      o.frequency.value = f;
+      g.gain.value = level;
+      l.frequency.value = rate;
+      lg.gain.value = level * 0.55;
+      l.connect(lg);
+      lg.connect(g.gain);
+      o.connect(g);
+      g.connect(dest);
+      srcs.push(o, l);
+      return o;
+    }
     const AMB = {
-      // a dark pad of two detuned saws whose filter slowly breathes, a faint high hiss, and the whoosh of a drag
+      // A slow pad moving between two chords, high voices that shimmer when you drag (and bend in
+      // pitch, like light near the hole), all of it standing in the hall. No noise anywhere.
       horizon(c, d) {
-        const out = fadeIn(c, d, 3);
-        const lp = filter(c, "lowpass", 420, 3), pad = c.createGain();
-        pad.gain.value = 0.07;
-        lp.connect(pad);
-        pad.connect(out);
-        const s1 = c.createOscillator(), s2 = c.createOscillator(), s3 = c.createOscillator(), sub = c.createGain();
-        s1.type = s2.type = "sawtooth";
-        s1.frequency.value = 55;
-        s2.frequency.value = 55.35;
-        s3.frequency.value = 27.5;
-        sub.gain.value = 0.3;
-        s1.connect(lp);
-        s2.connect(lp);
-        s3.connect(sub);
-        sub.connect(pad);
-        const lfo = c.createOscillator(), lfoG = c.createGain();
-        lfo.frequency.value = 0.045;
-        lfoG.gain.value = 200;
-        lfo.connect(lfoG);
-        lfoG.connect(lp.frequency);
-        const h = loopNoise(c), hbp = filter(c, "bandpass", 3600, 7), hg = c.createGain();
-        hg.gain.value = 0.012;
-        h.connect(hbp);
-        hbp.connect(hg);
-        hg.connect(out);
-        const w = loopNoise(c), wbp = filter(c, "bandpass", 420, 1.1), wg = c.createGain();
-        wg.gain.value = 0.0001;
-        w.connect(wbp);
-        wbp.connect(wg);
-        wg.connect(out);
-        return controller(c, out, [s1, s2, s3, lfo, h, w], {
+        const out = fadeIn(c, d, 4);
+        const wetIn = c.createGain();
+        wetIn.gain.setValueAtTime(0.0001, c.currentTime);
+        wetIn.gain.exponentialRampToValueAtTime(0.7, c.currentTime + 4);
+        wetIn.connect(d.verb || d);
+        const tone = filter(c, "lowpass", 1400, 0.4), level = c.createGain();
+        level.gain.value = 1;
+        tone.connect(level);
+        level.connect(out);
+        level.connect(wetIn);
+        const srcs = [], voices = [], PAD = 0.42;
+        const chordA = c.createGain(), chordB = c.createGain();
+        chordA.connect(tone);
+        chordB.connect(tone);
+        // A minor 9 (A1 E2 A2 C3 E3 B3) and F major 9 (F1 C2 A2 C3 G3 E4), each voice with a soft octave above
+        [[55, 0.05], [82.41, 0.034], [110, 0.03], [130.81, 0.024], [164.81, 0.02], [246.94, 0.013]].forEach(([f, a], i) => {
+          voices.push(drift(c, f, a * PAD, 0.031 + i * 0.011, chordA, srcs), drift(c, f * 2, a * PAD * 0.28, 0.047 + i * 0.009, chordA, srcs));
+        });
+        [[43.65, 0.05], [65.41, 0.034], [110, 0.03], [130.81, 0.024], [196.0, 0.02], [329.63, 0.012]].forEach(([f, a], i) => {
+          voices.push(drift(c, f, a * PAD, 0.029 + i * 0.012, chordB, srcs), drift(c, f * 2, a * PAD * 0.28, 0.043 + i * 0.01, chordB, srcs));
+        });
+        // the chords cross-fade every 18 seconds
+        const now0 = c.currentTime;
+        chordA.gain.setValueAtTime(1, now0);
+        chordB.gain.setValueAtTime(0.0001, now0);
+        for (let k = 1; k < 40; k++) {
+          const at = now0 + k * 18, toB = k % 2 === 1;
+          chordA.gain.setTargetAtTime(toB ? 0.0001 : 1, at, 3);
+          chordB.gain.setTargetAtTime(toB ? 1 : 0.0001, at, 3);
+        }
+        // high shimmer, nearly silent until you drag
+        const shim = c.createGain(), shimDry = c.createGain();
+        shim.gain.value = 0.0001;
+        shimDry.gain.value = 0.25;
+        shim.connect(shimDry);
+        shimDry.connect(out);
+        shim.connect(wetIn);
+        const highs = [880, 1318.51, 1975.53, 2637.02].map((f, i) => {
+          const o = c.createOscillator(), g = c.createGain(), trem = c.createOscillator(), tg = c.createGain();
+          o.frequency.value = f;
+          g.gain.value = 0.5 / (i + 1);
+          trem.frequency.value = 4.2 + i * 1.3;
+          tg.gain.value = 0.18 / (i + 1);
+          trem.connect(tg);
+          tg.connect(g.gain);
+          o.connect(g);
+          g.connect(shim);
+          srcs.push(o, trem);
+          return o;
+        });
+        let lastSp = -1, near = 1;
+        return controller(c, out, srcs, {
+          wet: wetIn,
           set(p) {
-            const now = c.currentTime, sp = Math.min(1, Math.abs(p.speed || 0) / 2.2), near = 1 - 0.65 * Math.min(1, p.scroll || 0);
-            wg.gain.setTargetAtTime(0.0001 + sp * 0.3, now, 0.07);
-            wbp.frequency.setTargetAtTime(360 + sp * 1700, now, 0.09);
-            pad.gain.setTargetAtTime(0.07 * near, now, 0.4);
-            s2.detune.setTargetAtTime(sp * 40, now, 0.2);
+            const now = c.currentTime, sp = Math.min(1, Math.abs(p.speed || 0) / 2.4);
+            if (Math.abs(sp - lastSp) > 0.01) {
+              lastSp = sp;
+              shim.gain.setTargetAtTime(0.0001 + sp * 0.07, now, 0.12);
+              tone.frequency.setTargetAtTime(1400 + sp * 2600, now, 0.2);
+              highs.forEach((o, i) => o.detune.setTargetAtTime(-sp * (18 + i * 6), now, 0.25));
+              voices.forEach((o) => o.detune.setTargetAtTime(-sp * 14, now, 0.4));
+            }
+            // scrolling away from the hole lets the pad fall back
+            const n2 = 1 - 0.6 * Math.min(1, p.scroll || 0);
+            if (Math.abs(n2 - near) > 0.01) { near = n2; level.gain.setTargetAtTime(near, now, 0.5); }
           }
         });
       },
-      // the room tone of a metal hall: noise ringing through narrow resonances, and a low hum
+      // a quiet metal hall, and while you drag, beads of metal sliding over each other
       mercury(c, d) {
         const out = fadeIn(c, d, 2.5);
+        const wetIn = c.createGain();
+        wetIn.gain.value = 0.5;
+        wetIn.connect(d.verb || d);
         const n = loopNoise(c);
-        const bands = [[520, 16, 0.09], [1245, 20, 0.05], [2210, 24, 0.025]].map(([f, q, v]) => {
+        const bands = [[520, 9, 0.05], [1245, 11, 0.026], [2210, 12, 0.012]].map(([f, q, v]) => {
           const b = filter(c, "bandpass", f, q), g = c.createGain();
           g.gain.value = v;
           n.connect(b);
@@ -2771,12 +2866,43 @@ void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
         lfo.connect(lg);
         lg.connect(bands[0].frequency);
         lg.connect(bands[1].frequency);
-        const hum = c.createOscillator(), hg = c.createGain();
-        hum.frequency.value = 110;
-        hg.gain.value = 0.02;
-        hum.connect(hg);
-        hg.connect(out);
-        return controller(c, out, [n, lfo, hum], {});
+        // the slosh under a moving finger: dark noise whose cutoff rolls like a wave
+        const sl = loopNoise(c), slp = filter(c, "lowpass", 420, 2.2), sg = c.createGain();
+        sg.gain.value = 0.0001;
+        sl.connect(slp);
+        slp.connect(sg);
+        sg.connect(out);
+        sg.connect(wetIn);
+        const roll = c.createOscillator(), rg = c.createGain();
+        roll.frequency.value = 2.6;
+        rg.gain.value = 140;
+        roll.connect(rg);
+        rg.connect(slp.frequency);
+        let drag = 0, timer = 0;
+        const beads = () => {
+          if (c.state === "running" && drag > 0.04) {
+            const t = c.currentTime + 0.005, f = 1700 + Math.random() * 2000, p = Math.random() * 1.2 - 0.6;
+            const s = osc(c, "sine", f, t, t + 0.06);
+            s.frequency.exponentialRampToValueAtTime(f * 0.72, t + 0.035);
+            s.connect(env(c, pan(c, out, p), t, 0.002, 0.03 * drag, 0.035));
+            s.connect(env(c, wetIn, t, 0.002, 0.05 * drag, 0.035));
+          }
+          if (c.state !== "closed") timer = setTimeout(beads, 22 + Math.random() * (90 - 60 * drag));
+        };
+        beads();
+        return controller(c, out, [n, lfo, sl, roll], {
+          wet: wetIn,
+          set(p) {
+            if (p.drag == null) return;
+            const v = Math.min(1, p.drag / 1600);
+            if (Math.abs(v - drag) < 0.01) return;
+            drag = v;
+            const now = c.currentTime;
+            sg.gain.setTargetAtTime(0.0001 + drag * 0.09, now, 0.08);
+            slp.frequency.setTargetAtTime(380 + drag * 520, now, 0.1);
+          },
+          end() { clearTimeout(timer); }
+        });
       },
       // wind in the valley, a bird now and then, and the brush on paper
       ink(c, d) {
@@ -3141,13 +3267,17 @@ vec3 starLayer(vec3 d, float cells, float density, float seed) {
 
 vec3 sky(vec3 d) {
   vec3 col = starLayer(d, 55.0, 0.16, 1.0) + starLayer(d, 110.0, 0.09, 17.0) * 0.75 + starLayer(d, 210.0, 0.05, 41.0) * 0.5;
+  col += vec3(0.005, 0.009, 0.026);
   vec3 bn = normalize(vec3(0.32, 1.0, -0.28));
   float lat = dot(d, bn);
   float band = exp(-lat * lat * 9.0);
-  float f = fbm(d * 2.4 + 3.0);
-  float dust = smoothstep(0.42, 0.72, fbm(d * 5.5 - 9.0));
-  vec3 milky = mix(vec3(0.13, 0.15, 0.34), vec3(0.64, 0.48, 0.34), f) * band * (0.2 + f) * (1.0 - 0.8 * dust * band);
-  return col + milky * 0.2 + vec3(0.005, 0.009, 0.026) * (0.5 + f);
+  if (band > 0.1) {
+    float f = fbm(d * 2.4 + 3.0);
+    float dust = smoothstep(0.42, 0.72, fbm(d * 5.5 - 9.0));
+    vec3 milky = mix(vec3(0.13, 0.15, 0.34), vec3(0.64, 0.48, 0.34), f) * band * (0.2 + f) * (1.0 - 0.8 * dust * band);
+    col += milky * 0.2 * smoothstep(0.1, 0.2, band);
+  }
+  return col;
 }
 
 vec3 ramp(float t) {
@@ -3174,8 +3304,9 @@ vec4 disk(vec3 p, float r, vec3 dir) {
   float gam = inversesqrt(1.0 - beta * beta);
   float D = 1.0 / (gam * (1.0 - beta * dot(vdir, -dir)));
   float g = D * sqrt(max(1.0 - 1.0 / r, 0.0));
-  float dens = inner * outer * (0.35 + 0.95 * n * (0.55 + 0.7 * n2));
-  float streak = 0.72 + 0.28 * sin(r * 11.0 + n2 * 7.0);
+  float fil = 0.6 * pnoise(vec2(r * 14.0, q.y * 2.0), 80.0) + 0.4 * pnoise(vec2(r * 33.0, q.y * 4.0), 160.0);
+  float dens = inner * outer * (0.35 + 0.95 * n * (0.55 + 0.7 * n2)) * (0.62 + 0.76 * fil);
+  float streak = 0.7 + 0.3 * sin(r * 18.0 + n2 * 8.0);
   float em = dens * streak * pow(g, 3.2) * (0.25 + 3.2 * temp * temp);
   float alpha = clamp(dens * (0.45 + 0.75 * temp), 0.0, 1.0);
   return vec4(ramp(temp * g * 1.08) * em * 2.4, alpha);
@@ -3217,7 +3348,7 @@ void main() {
     vel = nv;
   }
   if (escaped) acc += trans * sky(normalize(vel));
-  acc += glow * vec3(1.0, 0.6, 0.24) * 0.04;
+  acc += glow * vec3(1.0, 0.6, 0.24) * 0.03;
   acc *= uGain * uDim;
   vec3 col = 1.0 - exp(-acc * 1.3);
   col = pow(col, vec3(0.95)) + (h12(gl_FragCoord.xy + fract(uTime * 7.0) * 113.0) - 0.5) / 255.0;
@@ -3331,8 +3462,7 @@ void main() {
       if (!drag || e.pointerId !== drag.id) return;
       // a tap (not a drag) on the black hole: a deep boom and the chirp of a merger
       if (e.type === "pointerup" && Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) < 8 && performance.now() - drag.st < 400) {
-        SFX.play("boom");
-        SFX.play("chirp");
+        SFX.play("hit");
       }
       drag = null;
     }
@@ -3354,7 +3484,7 @@ void main() {
       try { prog = glProgram(gl, FS); } catch (err) { return fail(err); }
       const r = canvas.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
-      gov = governor(0.45, Math.min(2, dpr), clamp(Math.sqrt(1.2e6 / Math.max(1, r.width * r.height)), 0.6, Math.min(dpr, 1.5)));
+      gov = governor(Math.min(dpr, 1.5), Math.min(3, dpr), clamp(Math.sqrt(3.2e6 / Math.max(1, r.width * r.height)), Math.min(dpr, 1.5), Math.min(dpr, 3)));
       ac = new AbortController();
       const on = { signal: ac.signal };
       hero.addEventListener("pointerdown", onDown, on);
@@ -3388,7 +3518,9 @@ void main() {
     function step(sec) { if (!gl) return; for (let i = 0; i < Math.round(sec * 60); i++) tick(1 / 60); }
     function shot(type) { if (!gl) return ""; dirty = true; tick(0); return canvas.toDataURL(type || "image/jpeg", 0.85); }
 
-    return { mount, unmount, step, shot };
+    // testing: pin the render scale (1 = one pixel per CSS pixel) with the governor off
+    function quality(q) { if (!gl) return; gov = { scale: q, draw: (g2, d) => { d(); return false; } }; resize(); }
+    return { mount, unmount, step, shot, quality };
   })();
   /* ---------- Liquid Metal: the name pushed up out of a pool of chrome. Touch makes ripples;
      the chrome reflects a studio lit by soft boxes that slide as you move. ---------- */
@@ -3513,7 +3645,7 @@ void main() {
 
     let canvas = null, gl = null, prog = null, loop = null, ac = null, ro = null, io = null, gov = null, tex = null;
     let W = 1, H = 1, scale = 1, t = 0, riseT = -1, rise = 0, inView = true, fieldW = 1, fieldH = 1;
-    let envX = 0, envY = 0, envTX = 0, envTY = 0, last = null, drip = 2.5, fontOk = false, sizeTimer = 0, tubeH = 9, lastPlop = 0;
+    let envX = 0, envY = 0, envTX = 0, envTY = 0, last = null, drip = 2.5, fontOk = false, sizeTimer = 0, tubeH = 9, dragV = 0, prevMove = null;
     const rip = new Float32Array(RIPS * 4);
     let ripI = 0, letters = [];
 
@@ -3685,6 +3817,8 @@ void main() {
     function tick(dt) {
       t += dt;
       if (riseT >= 0) riseT += dt;
+      dragV *= Math.pow(0.015, dt);
+      SFX.set({ drag: dragV });
       rise = reduce ? (riseT >= 0 ? 1 : 0) : riseT <= 0 ? 0 : 1 - Math.exp(-5.2 * riseT) * Math.cos(7.2 * riseT);
       if (!reduce) {
         drip -= dt;
@@ -3710,12 +3844,20 @@ void main() {
       const r = canvas.getBoundingClientRect();
       return { x: e.clientX - r.left, y: e.clientY - r.top };
     }
+    // how fast the finger is moving through the metal (px/s); it drives the drag sound
+    function feel(p) {
+      const now = performance.now();
+      if (prevMove && now - prevMove.t < 150) {
+        const d = Math.hypot(p.x - prevMove.x, p.y - prevMove.y);
+        dragV = Math.max(dragV, (d / Math.max(8, now - prevMove.t)) * 1000);
+      }
+      prevMove = { x: p.x, y: p.y, t: now };
+    }
     function trail(p, amp) {
+      feel(p);
       if (last && Math.hypot(p.x - last.x, p.y - last.y) < 24) return;
       const d = last ? Math.hypot(p.x - last.x, p.y - last.y) : 30;
       ripple(p.x, p.y, amp * clamp(d / 40, 0.5, 1.6));
-      const now = performance.now();
-      if (now - lastPlop > 90) { lastPlop = now; SFX.play("drop", { pitch: 0.9 + (1 - p.y / H) * 0.9, gain: 0.32 }); }
       last = p;
     }
 
@@ -3742,7 +3884,7 @@ void main() {
       W = Math.max(1, r.width);
       H = Math.max(1, r.height);
       const dpr = window.devicePixelRatio || 1;
-      gov = governor(0.5, Math.min(2, dpr), clamp(Math.sqrt(1.4e6 / Math.max(1, W * H)), 0.6, Math.min(dpr, 1.75)));
+      gov = governor(Math.min(dpr, 1.5), Math.min(3, dpr), clamp(Math.sqrt(3.2e6 / Math.max(1, W * H)), Math.min(dpr, 1.5), Math.min(dpr, 3)));
       resize();
       fontOk = false;
       buildField();
@@ -4330,7 +4472,7 @@ void main() {
   labelLooks(current);
   langHooks.push(labelLooks);
 
-  let lookId = null, scene = null, wanted = null;
+  let lookId = null, scene = null, wanted = null, pending = 0;
   function mountLook(id) {
     if (id === lookId) return;
     if (scene) { try { scene.unmount(); } catch (e) { console.error(e); } }
@@ -4344,11 +4486,16 @@ void main() {
 
   // Taps can outrun the transition: the update always mounts the latest pick, never a stale one.
   function switchLook(id, from) {
-    if (BS.order.indexOf(id) < 0 || id === (wanted || lookId)) return;
+    if (BS.order.indexOf(id) < 0) return;
+    if (pending ? id === wanted : id === lookId) return;
     wanted = id;
     try { localStorage.setItem("bruce-style", id); } catch (e) {}
     SFX.play("to-" + id);
-    const go = () => { if (wanted && wanted !== lookId) { mountLook(wanted); window.scrollTo(0, 0); } };
+    const go = () => {
+      clearTimeout(pending);
+      pending = 0;
+      if (wanted && wanted !== lookId) { mountLook(wanted); window.scrollTo(0, 0); }
+    };
     if (reduce || !document.startViewTransition) return go();
     const r = from && from.getBoundingClientRect();
     const x = r ? r.left + r.width / 2 : innerWidth / 2;
@@ -4362,6 +4509,9 @@ void main() {
       vt.ready.catch(quiet);
       vt.finished.catch(quiet);
       vt.updateCallbackDone.catch(quiet);
+      // a transition waits for a painted frame; if none comes (screen locked, tab paused), switch anyway
+      clearTimeout(pending);
+      pending = setTimeout(() => { try { vt.skipTransition(); } catch (e) {} go(); }, 900);
     } catch (e) { go(); }
   }
 
