@@ -137,7 +137,7 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--signal); outlin
 }
 .bar, .layout { max-width: 28rem; margin-inline: auto; }
 .bar { display: flex; align-items: center; gap: 8px; padding-block: 4px 12px; }
-.bar .style-open { margin-right: auto; }
+.bar .sound-btn { margin-right: auto; }
 .layout { display: grid; gap: 28px; }
 .sheet { display: grid; gap: 44px; min-width: 0; }
 
@@ -568,6 +568,20 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--signal); outlin
 /* ---------- the other looks' heroes (hidden on the Gold Card) ---------- */
 .heroes, .hero { display: none; }
 .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* sound on/off: speaker with waves when on, a small cross when off; the waves pulse once sound is playing */
+.sound-btn { padding: 9px 10px; }
+.sound-btn svg { width: 15px; height: 15px; }
+.sound-btn .mute { display: none; }
+.sound-btn[aria-pressed="false"] .wave { display: none; }
+.sound-btn[aria-pressed="false"] .mute { display: inline; }
+.sound-btn.is-live .w1 { animation: snd-wave 1.3s ease-in-out infinite; }
+.sound-btn.is-live .w2 { animation: snd-wave 1.3s .22s ease-in-out infinite; }
+@keyframes snd-wave { 50% { opacity: .3; } }
+@media (max-width: 419px) {
+  .qr-open { padding: 9px 10px; }
+  .qr-open span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+}
 /* ---------- shell shared by the four new looks: full-screen hero, one reading column ---------- */
 html:not([data-style="classic"]) .page { padding-top: 0; }
 html:not([data-style="classic"]) .stage { display: none; }
@@ -1696,6 +1710,9 @@ html[data-style="ink"] .foot { font-style: italic; font-size: .9375rem; }
       <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.2 1.3l1.25 3.55L11 6.1 7.45 7.35 6.2 10.9 4.95 7.35 1.4 6.1l3.55-1.25zM12.3 9.4l.68 1.82 1.82.68-1.82.68-.68 1.82-.68-1.82-1.82-.68 1.82-.68z"/></svg>
       <span data-i18n="styleOpen">Style</span>
     </button>
+    <button type="button" class="pill sound-btn" id="sound-btn" aria-pressed="true" aria-label="Sound" data-i18n-aria="sound" title="Sound">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 6h2.6L8 3v10L4.6 10H2z" fill="currentColor"/><path class="wave w1" d="M10.3 6.1a2.6 2.6 0 0 1 0 3.8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path class="wave w2" d="M12.2 4.3a5.2 5.2 0 0 1 0 7.4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path class="mute" d="M10.6 6l3.8 4M14.4 6l-3.8 4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+    </button>
     <button type="button" class="pill qr-open" id="qr-open" aria-haspopup="dialog" aria-controls="qr">
       <svg viewBox="0 0 16 16" fill="currentColor" fill-rule="evenodd" aria-hidden="true"><path d="M1 1h6v6H1zm1.5 1.5v3h3v-3zM9 1h6v6H9zm1.5 1.5v3h3v-3zM1 9h6v6H1zm1.5 1.5v3h3v-3zM9 9h2v2H9zm2 2h2v2h-2zm2-2h2v2h-2zm-4 4h2v2H9zm4 0h2v2h-2z"/></svg>
       <span data-i18n="qrOpen">Show QR</span>
@@ -1999,6 +2016,7 @@ html[data-style="ink"] .foot { font-style: italic; font-size: .9375rem; }
     copy: "复制链接",
     done: "完成",
     styleOpen: "风格",
+    sound: "声音",
     looksTitle: "选择风格",
     looksSub: "同一个页面，五种风格。会记住你的选择。",
     looksH: "风格",
@@ -2213,6 +2231,500 @@ void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
       }
     };
   }
+  /* ---------- sound: every effect is synthesized live with Web Audio, no audio files.
+     Browsers allow sound only after a tap or key press, so nothing plays before that.
+     Phone speakers drop everything under ~200 Hz, so low sounds carry audible overtones. ---------- */
+  const SFX = (() => {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    let ctx = null, bus = null, live = false, amb = null, ambId = null, want = null, on = true, queue = [];
+    try { on = localStorage.getItem("bruce-sound") !== "off"; } catch (e) {}
+    const noiseCache = new WeakMap(), pluckCache = new Map();
+    // C major pentatonic (宫商角徵羽), C3 to G5, for the ink brush; marimba notes for B R U C E G A O
+    const SCALE = [130.81, 146.83, 164.81, 196.0, 220.0, 261.63, 293.66, 329.63, 392.0, 440.0, 523.25, 587.33, 659.25, 783.99];
+    const MARIMBA = [523.25, 587.33, 659.25, 783.99, 880.0, 1046.5, 1174.66, 1318.51];
+
+    function master(c) {
+      const comp = c.createDynamicsCompressor();
+      comp.threshold.value = -18;
+      comp.knee.value = 12;
+      comp.ratio.value = 5;
+      comp.attack.value = 0.004;
+      comp.release.value = 0.2;
+      const g = c.createGain();
+      g.gain.value = on ? 0.9 : 0.0001;
+      g.connect(comp);
+      comp.connect(c.destination);
+      return g;
+    }
+    function noise(c) {
+      let b = noiseCache.get(c);
+      if (!b) {
+        b = c.createBuffer(1, Math.floor(c.sampleRate * 2), c.sampleRate);
+        const d = b.getChannelData(0);
+        for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+        noiseCache.set(c, b);
+      }
+      return b;
+    }
+    // a gain that swells to `peak` in `a` seconds and dies away over `d`
+    function env(c, dest, t, a, peak, d) {
+      const g = c.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + a + d);
+      g.connect(dest);
+      return g;
+    }
+    function osc(c, type, f, t, end) {
+      const o = c.createOscillator();
+      o.type = type;
+      o.frequency.setValueAtTime(f, t);
+      o.start(t);
+      o.stop(end);
+      return o;
+    }
+    function hiss(c, t, end) {
+      const s = c.createBufferSource();
+      s.buffer = noise(c);
+      s.loop = true;
+      s.start(t, Math.random() * 1.8);
+      s.stop(end);
+      return s;
+    }
+    function loopNoise(c) {
+      const s = c.createBufferSource();
+      s.buffer = noise(c);
+      s.loop = true;
+      return s;
+    }
+    function filter(c, type, f, q) {
+      const b = c.createBiquadFilter();
+      b.type = type;
+      b.frequency.value = f;
+      if (q != null) b.Q.value = q;
+      return b;
+    }
+    function pan(c, dest, p) {
+      if (!p || !c.createStereoPanner) return dest;
+      const s = c.createStereoPanner();
+      s.pan.value = p;
+      s.connect(dest);
+      return s;
+    }
+    function swoosh(c, d, t, f0, f1, dur, peak) {
+      const n = hiss(c, t, t + dur + 0.05);
+      const bp = filter(c, "bandpass", f0, 1.4);
+      bp.frequency.exponentialRampToValueAtTime(f1, t + dur);
+      const g = c.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(peak, t + dur * 0.45);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      n.connect(bp);
+      bp.connect(g);
+      g.connect(d);
+    }
+    // A plucked string by the Karplus-Strong method, computed once per note: a burst of soft
+    // noise recirculating through a delay one period long, losing its brightness each pass.
+    function pluckBuffer(c, f) {
+      const key = c.sampleRate + ":" + f.toFixed(2);
+      if (pluckCache.has(key)) return pluckCache.get(key);
+      const sr = c.sampleRate, n = Math.floor(sr * 2.6), P = Math.max(2, Math.round(sr / f - 0.5));
+      const d = new Float32Array(n);
+      let lp = 0;
+      for (let i = 0; i < P; i++) { lp += (Math.random() * 2 - 1 - lp) * 0.42; d[i] = lp; }
+      for (let i = P; i < n; i++) d[i] = 0.4975 * (d[i - P] + (i - P - 1 >= 0 ? d[i - P - 1] : 0));
+      let peak = 0;
+      for (let i = 0; i < n; i++) peak = Math.max(peak, Math.abs(d[i]));
+      const b = c.createBuffer(1, n, sr);
+      const out = b.getChannelData(0), k = peak > 0 ? 0.85 / peak : 1;
+      for (let i = 0; i < n; i++) out[i] = d[i] * k;
+      pluckCache.set(key, b);
+      return b;
+    }
+
+    const FX = {
+      tap(c, d, t) {
+        const o = osc(c, "sine", 1650, t, t + 0.12);
+        o.frequency.exponentialRampToValueAtTime(820, t + 0.06);
+        o.connect(env(c, d, t, 0.003, 0.16, 0.07));
+      },
+      open(c, d, t) { swoosh(c, d, t, 260, 2400, 0.32, 0.12); },
+      close(c, d, t) { swoosh(c, d, t, 2200, 300, 0.26, 0.09); },
+      boom(c, d, t) {
+        const sub = osc(c, "sine", 95, t, t + 2.1);
+        sub.frequency.exponentialRampToValueAtTime(31, t + 1.6);
+        sub.connect(env(c, d, t, 0.01, 0.7, 1.9));
+        const mid = osc(c, "triangle", 170, t, t + 0.9);
+        mid.frequency.exponentialRampToValueAtTime(70, t + 0.5);
+        mid.connect(env(c, d, t, 0.005, 0.32, 0.6));
+        const n = hiss(c, t, t + 1.4), lp = filter(c, "lowpass", 600, 0.7);
+        lp.frequency.exponentialRampToValueAtTime(80, t + 1.2);
+        n.connect(lp);
+        lp.connect(env(c, d, t, 0.004, 0.4, 1.0));
+      },
+      // two black holes spiralling together: the pitch and loudness climb ever faster (f ∝ τ^-3/8,
+      // the shape of the gravitational-wave chirp), then a short ringdown
+      chirp(c, d, t) {
+        const T = 0.95, steps = 96, fr = new Float32Array(steps), gr = new Float32Array(steps);
+        for (let i = 0; i < steps; i++) {
+          const tau = 1 - (i / (steps - 1)) * 0.985;
+          const f = Math.min(1100, 110 * Math.pow(tau, -0.375));
+          fr[i] = f;
+          gr[i] = 0.04 + 0.32 * Math.pow(f / 1100, 0.7);
+        }
+        const o = c.createOscillator();
+        o.type = "sine";
+        o.frequency.setValueCurveAtTime(fr, t, T);
+        const g = c.createGain();
+        g.gain.setValueCurveAtTime(gr, t, T);
+        g.gain.setTargetAtTime(0.0001, t + T + 0.001, 0.05);
+        o.connect(g);
+        g.connect(d);
+        o.start(t);
+        o.stop(t + T + 0.4);
+        const rd = osc(c, "sine", 760, t + T, t + T + 0.5);
+        rd.frequency.exponentialRampToValueAtTime(560, t + T + 0.4);
+        rd.connect(env(c, d, t + T, 0.004, 0.2, 0.35));
+      },
+      // a drop of mercury: a quick falling plop and a thin metallic ring (two-operator FM)
+      drop(c, d, t, o) {
+        const p = o.pitch || 1, v = o.gain == null ? 1 : o.gain;
+        const s = osc(c, "sine", 1150 * p, t, t + 0.25);
+        s.frequency.exponentialRampToValueAtTime(260 * p, t + 0.085);
+        s.connect(env(c, d, t, 0.002, 0.34 * v, 0.16));
+        const car = osc(c, "sine", 1320 * p, t, t + 0.9), mod = osc(c, "sine", 1320 * p * 1.41, t, t + 0.9);
+        const mg = c.createGain();
+        mg.gain.setValueAtTime(700 * p, t);
+        mg.gain.exponentialRampToValueAtTime(1, t + 0.6);
+        mod.connect(mg);
+        mg.connect(car.frequency);
+        car.connect(env(c, d, t + 0.01, 0.004, 0.07 * v, 0.7));
+      },
+      swell(c, d, t) {
+        const n = hiss(c, t, t + 1.8), bp = filter(c, "bandpass", 300, 3);
+        bp.frequency.exponentialRampToValueAtTime(2200, t + 1.1);
+        n.connect(bp);
+        bp.connect(env(c, d, t, 0.5, 0.16, 1.1));
+        const s = osc(c, "sine", 140, t, t + 1.8);
+        s.frequency.exponentialRampToValueAtTime(420, t + 0.9);
+        s.connect(env(c, d, t, 0.3, 0.12, 1.2));
+      },
+      marimba(c, d, t, o) {
+        const f = o.f || MARIMBA[(o.i || 0) % MARIMBA.length];
+        osc(c, "sine", f, t, t + 0.7).connect(env(c, d, t, 0.002, 0.28, 0.55));
+        osc(c, "sine", f * 3.93, t, t + 0.2).connect(env(c, d, t, 0.001, 0.09, 0.07));
+        osc(c, "triangle", f * 9.4, t, t + 0.05).connect(env(c, d, t, 0.0005, 0.03, 0.02));
+      },
+      stamp(c, d, t, o) {
+        const v = o.gain == null ? 1 : o.gain;
+        const s = osc(c, "sine", 150, t, t + 0.25);
+        s.frequency.exponentialRampToValueAtTime(55, t + 0.12);
+        s.connect(env(c, d, t, 0.002, 0.5 * v, 0.14));
+        const n = hiss(c, t, t + 0.1), lp = filter(c, "lowpass", 1400, 0.7);
+        n.connect(lp);
+        lp.connect(env(c, d, t, 0.001, 0.3 * v, 0.05));
+      },
+      // a string plucked like a guqin: a little slide up into the note, a woody body
+      pluck(c, d, t, o) {
+        const v = o.gain == null ? 1 : o.gain;
+        const src = c.createBufferSource();
+        src.buffer = pluckBuffer(c, o.f || 293.66);
+        src.playbackRate.setValueAtTime(0.965, t);
+        src.playbackRate.exponentialRampToValueAtTime(1, t + 0.07);
+        const lp = filter(c, "lowpass", 2600, 0.5), body = filter(c, "peaking", 240, 1.2);
+        body.gain.value = 5;
+        const g = c.createGain();
+        g.gain.value = 0.55 * v;
+        src.connect(lp);
+        lp.connect(body);
+        body.connect(g);
+        g.connect(pan(c, d, o.pan || 0));
+        src.start(t);
+        src.stop(t + 2.7);
+      },
+      plop(c, d, t) {
+        const s = osc(c, "sine", 1700, t, t + 0.2);
+        s.frequency.exponentialRampToValueAtTime(420, t + 0.06);
+        s.connect(env(c, d, t, 0.002, 0.26, 0.12));
+      },
+      bell(c, d, t, o) {
+        const f = o.f || 1046.5;
+        [[1, 0.2, 2.4], [2.76, 0.06, 1.2], [5.4, 0.03, 0.6]].forEach(([r, a, dur]) => {
+          osc(c, "sine", f * r, t, t + dur + 0.1).connect(env(c, d, t, 0.002, a, dur));
+        });
+      },
+      shutter(c, d, t) {
+        [0, 0.07].forEach((k) => {
+          const n = hiss(c, t + k, t + k + 0.04), hp = filter(c, "highpass", 2500, 0.7);
+          n.connect(hp);
+          hp.connect(env(c, d, t + k, 0.001, 0.22, 0.03));
+        });
+      },
+      tick(c, d, t) {
+        const n = hiss(c, t, t + 0.03), bp = filter(c, "bandpass", 3200, 2);
+        n.connect(bp);
+        bp.connect(env(c, d, t, 0.001, 0.2, 0.02));
+      },
+      bird(c, d, t, o) {
+        const p = pan(c, d, o.pan || 0), base = 2600 + Math.random() * 1200, k = 2 + Math.floor(Math.random() * 3);
+        for (let i = 0; i < k; i++) {
+          const tt = t + i * (0.11 + Math.random() * 0.05);
+          const s = osc(c, "sine", base, tt, tt + 0.12);
+          s.frequency.exponentialRampToValueAtTime(base * (1.25 + Math.random() * 0.2), tt + 0.05);
+          s.frequency.exponentialRampToValueAtTime(base * 0.9, tt + 0.1);
+          s.connect(env(c, p, tt, 0.005, 0.035, 0.08));
+        }
+      },
+      // what each look sounds like as it opens
+      "to-horizon"(c, d, t) { FX.boom(c, d, t); FX.chirp(c, d, t + 0.25); },
+      "to-mercury"(c, d, t) { FX.drop(c, d, t, { pitch: 0.8, gain: 1.2 }); FX.swell(c, d, t + 0.15); },
+      "to-poster"(c, d, t) { FX.stamp(c, d, t, {}); MARIMBA.slice(0, 5).forEach((f, i) => FX.marimba(c, d, t + 0.12 + i * 0.075, { f })); },
+      "to-ink"(c, d, t) { SCALE.slice(5, 11).forEach((f, i) => FX.pluck(c, d, t + i * 0.085, { f, gain: 0.7, pan: -0.4 + i * 0.16 })); },
+      "to-classic"(c, d, t) { FX.bell(c, d, t, { f: 1318.5 }); FX.bell(c, d, t + 0.16, { f: 1760 }); }
+    };
+
+    /* the background of each look, with a few live controls */
+    function fadeIn(c, dest, secs) {
+      const g = c.createGain();
+      g.gain.setValueAtTime(0.0001, c.currentTime);
+      g.gain.exponentialRampToValueAtTime(1, c.currentTime + secs);
+      g.connect(dest);
+      return g;
+    }
+    function controller(c, out, srcs, extra) {
+      srcs.forEach((s) => s.start());
+      const api = Object.assign({}, extra);
+      api.stop = (f) => {
+        const now = c.currentTime;
+        if (out.gain.cancelAndHoldAtTime) out.gain.cancelAndHoldAtTime(now); else out.gain.cancelScheduledValues(now);
+        out.gain.setTargetAtTime(0.0001, now, f / 4);
+        srcs.forEach((s) => { try { s.stop(now + f + 0.1); } catch (e) {} });
+        if (extra && extra.end) extra.end();
+        setTimeout(() => out.disconnect(), (f + 0.3) * 1000);
+      };
+      return api;
+    }
+    const AMB = {
+      // a dark pad of two detuned saws whose filter slowly breathes, a faint high hiss, and the whoosh of a drag
+      horizon(c, d) {
+        const out = fadeIn(c, d, 3);
+        const lp = filter(c, "lowpass", 420, 3), pad = c.createGain();
+        pad.gain.value = 0.07;
+        lp.connect(pad);
+        pad.connect(out);
+        const s1 = c.createOscillator(), s2 = c.createOscillator(), s3 = c.createOscillator(), sub = c.createGain();
+        s1.type = s2.type = "sawtooth";
+        s1.frequency.value = 55;
+        s2.frequency.value = 55.35;
+        s3.frequency.value = 27.5;
+        sub.gain.value = 0.3;
+        s1.connect(lp);
+        s2.connect(lp);
+        s3.connect(sub);
+        sub.connect(pad);
+        const lfo = c.createOscillator(), lfoG = c.createGain();
+        lfo.frequency.value = 0.045;
+        lfoG.gain.value = 200;
+        lfo.connect(lfoG);
+        lfoG.connect(lp.frequency);
+        const h = loopNoise(c), hbp = filter(c, "bandpass", 3600, 7), hg = c.createGain();
+        hg.gain.value = 0.012;
+        h.connect(hbp);
+        hbp.connect(hg);
+        hg.connect(out);
+        const w = loopNoise(c), wbp = filter(c, "bandpass", 420, 1.1), wg = c.createGain();
+        wg.gain.value = 0.0001;
+        w.connect(wbp);
+        wbp.connect(wg);
+        wg.connect(out);
+        return controller(c, out, [s1, s2, s3, lfo, h, w], {
+          set(p) {
+            const now = c.currentTime, sp = Math.min(1, Math.abs(p.speed || 0) / 2.2), near = 1 - 0.65 * Math.min(1, p.scroll || 0);
+            wg.gain.setTargetAtTime(0.0001 + sp * 0.3, now, 0.07);
+            wbp.frequency.setTargetAtTime(360 + sp * 1700, now, 0.09);
+            pad.gain.setTargetAtTime(0.07 * near, now, 0.4);
+            s2.detune.setTargetAtTime(sp * 40, now, 0.2);
+          }
+        });
+      },
+      // the room tone of a metal hall: noise ringing through narrow resonances, and a low hum
+      mercury(c, d) {
+        const out = fadeIn(c, d, 2.5);
+        const n = loopNoise(c);
+        const bands = [[520, 16, 0.09], [1245, 20, 0.05], [2210, 24, 0.025]].map(([f, q, v]) => {
+          const b = filter(c, "bandpass", f, q), g = c.createGain();
+          g.gain.value = v;
+          n.connect(b);
+          b.connect(g);
+          g.connect(out);
+          return b;
+        });
+        const lfo = c.createOscillator(), lg = c.createGain();
+        lfo.frequency.value = 0.08;
+        lg.gain.value = 30;
+        lfo.connect(lg);
+        lg.connect(bands[0].frequency);
+        lg.connect(bands[1].frequency);
+        const hum = c.createOscillator(), hg = c.createGain();
+        hum.frequency.value = 110;
+        hg.gain.value = 0.02;
+        hum.connect(hg);
+        hg.connect(out);
+        return controller(c, out, [n, lfo, hum], {});
+      },
+      // wind in the valley, a bird now and then, and the brush on paper
+      ink(c, d) {
+        const out = fadeIn(c, d, 3);
+        const wnd = loopNoise(c), lp = filter(c, "lowpass", 600, 0.6), hp = filter(c, "highpass", 140, 0.6), wg = c.createGain();
+        wg.gain.value = 0.06;
+        wnd.connect(lp);
+        lp.connect(hp);
+        hp.connect(wg);
+        wg.connect(out);
+        const lfo = c.createOscillator(), lg = c.createGain(), lfo2 = c.createOscillator(), lg2 = c.createGain();
+        lfo.frequency.value = 0.05;
+        lg.gain.value = 0.035;
+        lfo.connect(lg);
+        lg.connect(wg.gain);
+        lfo2.frequency.value = 0.031;
+        lg2.gain.value = 220;
+        lfo2.connect(lg2);
+        lg2.connect(lp.frequency);
+        const br = loopNoise(c), bbp = filter(c, "bandpass", 2400, 0.8), bg = c.createGain();
+        bg.gain.value = 0.0001;
+        br.connect(bbp);
+        bbp.connect(bg);
+        bg.connect(out);
+        let timer = 0;
+        const birds = () => {
+          timer = setTimeout(() => {
+            if (c.state === "running") FX.bird(c, out, c.currentTime + 0.02, { pan: Math.random() * 1.4 - 0.7 });
+            if (c.state !== "closed") birds();
+          }, 7000 + Math.random() * 11000);
+        };
+        birds();
+        return controller(c, out, [wnd, lfo, lfo2, br], {
+          set(p) {
+            if (p.brush == null) return;
+            const now = c.currentTime, v = Math.min(1, p.brush / 1400);
+            bg.gain.setTargetAtTime(0.0001 + v * 0.15, now, 0.04);
+            bbp.frequency.setTargetAtTime(1800 + v * 2400, now, 0.06);
+          },
+          end() { clearTimeout(timer); }
+        });
+      },
+      // a fine metallic shimmer that follows the card as it tilts
+      classic(c, d) {
+        const out = fadeIn(c, d, 0.5);
+        const n = loopNoise(c), hp = filter(c, "highpass", 6500, 0.7), g = c.createGain();
+        g.gain.value = 0.0001;
+        n.connect(hp);
+        hp.connect(g);
+        g.connect(out);
+        return controller(c, out, [n], {
+          set(p) { if (p.shimmer != null) g.gain.setTargetAtTime(0.0001 + Math.min(1, p.shimmer) * 0.06, c.currentTime, 0.06); }
+        });
+      }
+    };
+
+    /* ---------- live playback ---------- */
+    const btn = $("#sound-btn");
+    const ready = () => on && live && ctx && ctx.state === "running";
+    function paint() {
+      if (!btn) return;
+      btn.setAttribute("aria-pressed", String(on));
+      btn.classList.toggle("is-live", on && live);
+    }
+    function play(name, opts) {
+      if (!on || !FX[name]) return;
+      // the tap that wakes the audio up is heard too: hold its sound until the context is running
+      if (!ready()) { if (ctx) queue.push([name, opts, performance.now()]); return; }
+      try { FX[name](ctx, bus, ctx.currentTime + 0.005, opts || {}); } catch (e) { console.warn(e); }
+    }
+    function scene(id) {
+      want = id;
+      if (!ready() || ambId === id) return;
+      if (amb) amb.stop(0.8);
+      amb = null;
+      ambId = id;
+      try { amb = AMB[id] ? AMB[id](ctx, bus) : null; } catch (e) { console.warn(e); }
+    }
+    function set(p) { if (amb && amb.set && ready()) amb.set(p); }
+    function begin() {
+      if (!ctx || ctx.state !== "running") return;
+      const first = !live;
+      live = true;
+      if (first || !amb) { ambId = null; if (want) scene(want); }
+      const held = queue, t = performance.now();
+      queue = [];
+      held.forEach(([n, o, at]) => { if (t - at < 500) play(n, o); });
+      paint();
+    }
+    function unlock() {
+      if (!on || !AC) return;
+      if (!ctx) {
+        try { ctx = new AC({ latencyHint: "interactive" }); } catch (e) { try { ctx = new AC(); } catch (e2) { return; } }
+        bus = master(ctx);
+      }
+      if (ctx.state === "running") begin();
+      else ctx.resume().then(begin, () => {});
+    }
+    function toggle() {
+      on = !on;
+      try { localStorage.setItem("bruce-sound", on ? "on" : "off"); } catch (e) {}
+      if (on) {
+        unlock();
+        if (ctx) bus.gain.setTargetAtTime(0.9, ctx.currentTime, 0.05);
+        setTimeout(() => play("tap"), 40);
+      } else if (ctx) {
+        if (amb) amb.stop(0.3);
+        amb = null;
+        ambId = null;
+        bus.gain.setTargetAtTime(0.0001, ctx.currentTime, 0.05);
+      }
+      paint();
+    }
+    // any tap or key unlocks sound (touchend and click count as a gesture on iPhone; touchstart does not)
+    ["pointerdown", "pointerup", "touchend", "click", "keydown"].forEach((ev) => addEventListener(ev, unlock, { capture: true, passive: true }));
+    document.addEventListener("visibilitychange", () => {
+      if (!ctx) return;
+      if (document.hidden) ctx.suspend().catch(() => {});
+      else if (on && live) ctx.resume().catch(() => {});
+    });
+    if (btn) btn.addEventListener("click", toggle);
+    paint();
+
+    // the shared controls
+    $$(".lang button").forEach((b) => b.addEventListener("click", () => play("tap")));
+    [["#qr-open", "open"], ["#qr-done", "close"], ["#qr-copy", "tap"]].forEach(([sel, name]) => { const el = $(sel); if (el) el.addEventListener("click", () => play(name)); });
+    $$(".shot").forEach((s) => s.addEventListener("click", () => play("shutter")));
+    const track = $("#viewer-track"), viewerEl = $("#viewer");
+    if (track && viewerEl) {
+      let at = -1;
+      track.addEventListener("scroll", () => {
+        const i = Math.round(track.scrollLeft / Math.max(1, track.clientWidth));
+        if (i !== at) { if (at >= 0) play("tick"); at = i; }
+      }, { passive: true });
+      viewerEl.addEventListener("close", () => { at = -1; play("close"); });
+    }
+
+    // for testing without speakers: render any effect offline and measure it
+    async function render(name, secs, opts) {
+      const OC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+      const oc = new OC(2, Math.ceil(44100 * (secs || 2)), 44100);
+      const m = master(oc);
+      m.gain.value = 0.9;
+      if (FX[name]) FX[name](oc, m, 0.01, opts || {});
+      else if (AMB[name]) { const a = AMB[name](oc, m); if (opts && a.set) a.set(opts); }
+      const buf = await oc.startRendering();
+      const ch = buf.getChannelData(0);
+      let peak = 0, sum = 0;
+      for (let i = 0; i < ch.length; i++) { const v = Math.abs(ch[i]); if (v > peak) peak = v; sum += v * v; }
+      return { peak: +peak.toFixed(3), rms: +Math.sqrt(sum / ch.length).toFixed(4) };
+    }
+
+    return { play, scene, set, toggle, render, SCALE, get ready() { return ready(); }, get on() { return on; }, names: Object.keys(FX).concat(Object.keys(AMB)) };
+  })();
   /* ---------- Gold Card: the original foil card you can tilt ---------- */
   SCENES.classic = (() => {
     const card = $("#card");
@@ -2278,12 +2790,17 @@ void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
       s.setProperty("--sy", (22 + now.rx * 1.2).toFixed(1));
     }
     function follow() {
-      let moving = false;
+      let moving = false, mv = 0;
       for (const k in aim) {
         const d = aim[k] - now[k];
-        if (Math.abs(d) > 0.02) { now[k] += d * 0.14; moving = true; } else now[k] = aim[k];
+        if (Math.abs(d) > 0.02) {
+          now[k] += d * 0.14;
+          moving = true;
+          if (k === "rx" || k === "ry") mv += Math.abs(d * 0.14);
+        } else now[k] = aim[k];
       }
       paint();
+      SFX.set({ shimmer: moving ? Math.min(1, mv / 0.6) : 0 });
       raf = moving ? requestAnimationFrame(follow) : 0;
     }
     const wake = () => { if (!raf) raf = requestAnimationFrame(follow); };
@@ -2578,12 +3095,13 @@ void main() {
         read.textContent = `r ${D.toFixed(1)} rₛ · i ${(incl * 57.2958).toFixed(1)}° · φ ${(((az * 57.2958) % 360) + 360) % 360 | 0}°`;
       }
       if (scaled) resize();
+      SFX.set({ speed: cam.vaz, scroll: sc });
     }
     const draw = () => gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     function onDown(e) {
       if (e.button > 0 || e.target.closest("a, button")) return;
-      drag = { x: e.clientX, y: e.clientY, t: performance.now(), id: e.pointerId };
+      drag = { x: e.clientX, y: e.clientY, t: performance.now(), id: e.pointerId, sx: e.clientX, sy: e.clientY, st: performance.now() };
       cam.vaz = cam.vincl = 0;
     }
     function onMove(e) {
@@ -2603,7 +3121,15 @@ void main() {
       }
       dirty = true;
     }
-    function onUp(e) { if (drag && e.pointerId === drag.id) drag = null; }
+    function onUp(e) {
+      if (!drag || e.pointerId !== drag.id) return;
+      // a tap (not a drag) on the black hole: a deep boom and the chirp of a merger
+      if (e.type === "pointerup" && Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) < 8 && performance.now() - drag.st < 400) {
+        SFX.play("boom");
+        SFX.play("chirp");
+      }
+      drag = null;
+    }
 
     function fail(err) {
       console.warn("Event Horizon is showing its still picture:", err);
@@ -2781,7 +3307,7 @@ void main() {
 
     let canvas = null, gl = null, prog = null, loop = null, ac = null, ro = null, io = null, gov = null, tex = null;
     let W = 1, H = 1, scale = 1, t = 0, riseT = -1, rise = 0, inView = true, fieldW = 1, fieldH = 1;
-    let envX = 0, envY = 0, envTX = 0, envTY = 0, last = null, drip = 2.5, fontOk = false, sizeTimer = 0, tubeH = 9;
+    let envX = 0, envY = 0, envTX = 0, envTY = 0, last = null, drip = 2.5, fontOk = false, sizeTimer = 0, tubeH = 9, lastPlop = 0;
     const rip = new Float32Array(RIPS * 4);
     let ripI = 0, letters = [];
 
@@ -2946,6 +3472,7 @@ void main() {
 
     function rising() {
       riseT = 0;
+      SFX.play("swell");
       letters.forEach(([x, y], i) => ripple(x, y, 2.4, 0.15 + i * 0.07));
     }
 
@@ -2955,7 +3482,7 @@ void main() {
       rise = reduce ? (riseT >= 0 ? 1 : 0) : riseT <= 0 ? 0 : 1 - Math.exp(-5.2 * riseT) * Math.cos(7.2 * riseT);
       if (!reduce) {
         drip -= dt;
-        if (drip < 0) { ripple(Math.random() * W, H * (0.12 + Math.random() * 0.8), 1.1 + Math.random() * 1.2); drip = 2.2 + Math.random() * 3.5; }
+        if (drip < 0) { ripple(Math.random() * W, H * (0.12 + Math.random() * 0.8), 1.1 + Math.random() * 1.2); SFX.play("drop", { pitch: 1.4 + Math.random() * 0.5, gain: 0.14 }); drip = 2.2 + Math.random() * 3.5; }
       }
       const ax = reduce ? 0 : 0.05 * Math.sin(t * 0.23), ay = reduce ? 0 : 0.035 * Math.cos(t * 0.17);
       envX += (envTX + ax - envX) * Math.min(1, dt * 2.2);
@@ -2981,6 +3508,8 @@ void main() {
       if (last && Math.hypot(p.x - last.x, p.y - last.y) < 24) return;
       const d = last ? Math.hypot(p.x - last.x, p.y - last.y) : 30;
       ripple(p.x, p.y, amp * clamp(d / 40, 0.5, 1.6));
+      const now = performance.now();
+      if (now - lastPlop > 90) { lastPlop = now; SFX.play("drop", { pitch: 0.9 + (1 - p.y / H) * 0.9, gain: 0.32 }); }
       last = p;
     }
 
@@ -3034,6 +3563,7 @@ void main() {
         if (e.target.closest("a, button")) return;
         const p = local(e);
         ripple(p.x, p.y, 3.2);
+        SFX.play("drop", { pitch: 0.75 + (1 - p.y / H) * 0.8, gain: 1 });
         last = p;
       }, on);
       hero.addEventListener("touchmove", (e) => { const tt = e.touches[0]; if (tt) trail(local(tt), 1.5); }, onp);
@@ -3082,7 +3612,7 @@ void main() {
     const badge = $("#ps-badge");
     let loop = null, ac = null, ro = null, io = null;
     let t = 0, px = -1, py = -1, act = 0, rot = 0, lastY = 0, vel = 0, tx = 0, trackW = 0, NW = 1, NH = 1;
-    let centers = [];
+    let centers = [], lastNote = -1;
     const REST = '"wdth" 100, "wght" 800';
 
     function fillTrack() {
@@ -3133,6 +3663,7 @@ void main() {
       t += dt;
       act += ((px > -1 ? 1 : 0) - act) * Math.min(1, dt * 5);
       const idle = 1 - act;
+      let best = -1, bestF = 0, gi = 0;
       chars.forEach((line, li) => {
         const raw = line.map((c, i) => {
           const p = centers[li] && centers[li][i];
@@ -3141,6 +3672,8 @@ void main() {
             const dx = (p.x - px) / (NW * 0.2), dy = (p.y - py) / (NH * 0.9);
             f = Math.exp(-dx * dx - dy * dy);
           }
+          if (f > bestF) { bestF = f; best = gi; }
+          gi++;
           const wave = 0.5 + 0.5 * Math.sin(t * 1.5 - (i + li * 1.7) * 0.85);
           return act * f + idle * wave * 0.6;
         });
@@ -3151,6 +3684,9 @@ void main() {
           c.style.fontVariationSettings = `"wdth" ${w.toFixed(1)}, "wght" ${g}`;
         });
       });
+      if (px > -1 && best >= 0 && bestF > 0.55) {
+        if (best !== lastNote) { lastNote = best; SFX.play("marimba", { i: best }); }
+      } else if (px <= -1) lastNote = -1;
       const y = scrollY;
       vel += ((y - lastY) / Math.max(dt, 1 / 120) - vel) * 0.15;
       lastY = y;
@@ -3235,7 +3771,7 @@ void main() {
     let canvases = [], ink = null, ctx = null, wet = null, wctx = null, loop = null, ac = null, ro = null, io = null, timers = [], resizeTimer = 0;
     let W = 1, H = 1, S = 1, seed = 1, jitter = [], gen = 0;
     let down = null, last = null, wid = 8, load = 1, brush = [], blooms = [], dirty = false, fadeT = 0, idleT = 0;
-    let mx = 0, tmx = 0;
+    let mx = 0, tmx = 0, travel = 0, tunes = [];
 
     const hash = (n) => { const x = Math.sin(n * 127.1 + seed * 311.7) * 43758.5453; return x - Math.floor(x); };
     const hash2 = (x, y) => { const v = Math.sin(x * 127.1 + y * 311.7 + seed * 74.7) * 43758.5453; return v - Math.floor(v); };
@@ -3382,6 +3918,8 @@ void main() {
       idleT = 0;
     }
     function drop(x, y) {
+      SFX.play("plop");
+      SFX.play("pluck", { f: SFX.SCALE[3], gain: 0.55 });
       blooms.push({ x, y, R: 12 + Math.random() * 12, s: Math.random() * 100, t: 0 });
       ctx.fillStyle = "rgba(22,20,18,.55)";
       ctx.beginPath();
@@ -3416,6 +3954,7 @@ void main() {
       down = { id: e.pointerId, p, moved: 0 };
       last = p;
       wid = 9;
+      travel = 0;
       newBrush();
     }
     function onMove(e) {
@@ -3430,12 +3969,20 @@ void main() {
       stroke(last, p, wid, nw);
       wid = nw;
       down.moved += dist;
+      SFX.set({ brush: speed });
+      travel += dist;
+      if (travel > 80) {
+        travel = 0;
+        const sc = SFX.SCALE, k = clamp(Math.floor((1 - p.y / H) * sc.length), 0, sc.length - 1);
+        SFX.play("pluck", { f: sc[k], gain: 0.45, pan: (p.x / W - 0.5) * 0.8 });
+      }
       last = p;
     }
     function onUp(e) {
       if (!down || e.pointerId !== down.id) return;
       if (down.moved < 6 && performance.now() - down.p.t < 400) drop(down.p.x, down.p.y);
       else bake();
+      SFX.set({ brush: 0 });
       down = null;
     }
 
@@ -3489,6 +4036,13 @@ void main() {
           col.innerHTML = Array.from(col.textContent).map((ch) => `<i style="animation-delay:${(1.1 + n++ * 0.12).toFixed(2)}s">${ch}</i>`).join("");
         });
       }
+      // arriving by a tap (sound already on): the line of poetry is plucked note by note as it is written
+      if (SFX.ready && !reduce) {
+        [5, 7, 8, 9, 8, 7, 5, 4, 5, 7, 8, 10, 9, 7].forEach((k, n) => {
+          tunes.push(setTimeout(() => SFX.play("pluck", { f: SFX.SCALE[k], gain: 0.4, pan: n < 7 ? 0.35 : 0.15 }), (1.1 + n * 0.12) * 1000));
+        });
+        tunes.push(setTimeout(() => SFX.play("stamp", { gain: 0.45 }), 2450));
+      }
       hero.addEventListener("pointerdown", onDown, on);
       addEventListener("pointermove", onMove, on);
       addEventListener("pointerup", onUp, on);
@@ -3504,6 +4058,8 @@ void main() {
 
     function unmount() {
       gen++;
+      tunes.forEach(clearTimeout);
+      tunes = [];
       timers.forEach(clearTimeout);
       clearTimeout(resizeTimer);
       timers = [];
@@ -3576,6 +4132,7 @@ void main() {
     lookId = id;
     scene = SCENES[id] || null;
     if (scene) { try { scene.mount(); } catch (e) { console.error(e); } }
+    SFX.scene(id);
     options.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.look === id)));
   }
 
@@ -3584,6 +4141,7 @@ void main() {
     if (BS.order.indexOf(id) < 0 || id === (wanted || lookId)) return;
     wanted = id;
     try { localStorage.setItem("bruce-style", id); } catch (e) {}
+    SFX.play("to-" + id);
     const go = () => { if (wanted && wanted !== lookId) { mountLook(wanted); window.scrollTo(0, 0); } };
     if (reduce || !document.startViewTransition) return go();
     const r = from && from.getBoundingClientRect();
@@ -3610,8 +4168,8 @@ void main() {
     } else switchLook(b.dataset.look, b);
   }));
   if (picker && $("#style-open")) {
-    const close = () => picker.close();
-    $("#style-open").addEventListener("click", () => picker.showModal());
+    const close = () => { picker.close(); SFX.play("close"); };
+    $("#style-open").addEventListener("click", () => { picker.showModal(); SFX.play("open"); });
     $("#looks-x").addEventListener("click", close);
     outside(picker, close);
   }
@@ -3625,7 +4183,8 @@ void main() {
     step: (sec) => scene && scene.step && scene.step(sec),
     shot: (type) => (scene && scene.shot ? scene.shot(type) : ""),
     get scene() { return lookId; },
-    get api() { return scene; }
+    get api() { return scene; },
+    sfx: SFX
   };
 })();
 </script>
